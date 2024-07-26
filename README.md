@@ -33,6 +33,7 @@ and user credentials.
 To use the script as a sendmail replacement:
 
 On Linux systems, configure /etc/mail.rc
+
 **set mta=/usr/local/bin/matrix_mta**
 
 And create symbolic links
@@ -44,6 +45,7 @@ sudo ln -sfv /usr/local/bin/matrix_mta /etc/alternatives/mailx
 ```
 
 On BSD systems, configure /etc/mailer.conf
+
 **sendmail        /usr/local/bin/matrix_mta**
 **send-mail       /usr/local/bin/matrix_mta**
 
