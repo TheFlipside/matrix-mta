@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: English Bug Report
+    url: https://github.com/LuminaAppsDev/handyshopper/issues/new?template=bug_report.yml
+    about: Report a bug using the English template
+  - name: English Feature Request
+    url: https://github.com/LuminaAppsDev/handyshopper/issues/new?template=feature_request.yml
+    about: Suggest a feature using the English template

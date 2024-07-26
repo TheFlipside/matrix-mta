@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+
+"""
+Matrix MTA Script
+
+This script acts as a sendmail replacement to send email to a Matrix server.
+It reads the email content from stdin, parses the subject and body, and sends
+the message to a specified Matrix room. If the room does not exist, it creates
+the room and invites the target user.
+
+Configuration:
+- The script reads configuration from /etc/matrix-mta.conf, if available.
+- Default values are provided for all configuration options.
+
+Logging:
+- Logs are written to /var/log/matrix-mta.log by default.
+- If the default log file location is not writable, it falls back to /tmp or
+  the current directory.
+
+Usage:
+- To use this script as a sendmail replacement:
+
+  On Linux systems, configure /etc/mail.rc
+  set mta=/usr/local/bin/matrix_mta
+
+  And create symbolic links
+  sudo ln -sv /usr/local/bin/matrix_mta /usr/sbin/sendmail
+  sudo ln -sfv /usr/local/bin/matrix_mta /etc/alternatives/mail
+  sudo ln -sfv /usr/local/bin/matrix_mta /etc/alternatives/mailx
+
+  On BSD systems, configure /etc/mailer.conf
+  sendmail        /usr/local/bin/matrix_mta
+  send-mail       /usr/local/bin/matrix_mta
+
+Test Commands:
+- echo -e "Subject: Test Email\n\nThis is a test email body." \
+  | sendmail -v recipient@example.com
+- echo "Test mail from $(hostname)" | mail -s "Test Email" root
+"""
+
+import os
+import sys
+import email
+import json
+import logging
+import argparse
+from http.client import HTTPSConnection
+
+# Default configuration
+CONFIG_FILE = '/etc/matrix-mta.conf'
+DEFAULT_MATRIX_SERVER_URL = 'https://matrix.example.com'
+DEFAULT_MATRIX_USERNAME = '@user01:matrix.example.com'
+DEFAULT_MATRIX_PASSWORD = 'matrixPassw0rd'
+DEFAULT_MATRIX_TARGET = '@user02:matrix.example.com'
+DEFAULT_ROOM_ID_FILE = '/var/matrix-mta/room-id'
+DEFAULT_LOG_FILE = '/var/log/matrix-mta.log'
+
+config = {
+    'MATRIX_SERVER_URL': DEFAULT_MATRIX_SERVER_URL,
+    'MATRIX_USERNAME': DEFAULT_MATRIX_USERNAME,
+    'MATRIX_PASSWORD': DEFAULT_MATRIX_PASSWORD,
+    'MATRIX_TARGET': DEFAULT_MATRIX_TARGET,
+    'ROOM_ID_FILE': DEFAULT_ROOM_ID_FILE,
+    'LOG_FILE': DEFAULT_LOG_FILE
+}
+
+# Load configuration
+if os.path.isfile(CONFIG_FILE):
+    with open(CONFIG_FILE, 'r', encoding='utf-8') as config_file:
+        for line in config_file:
+            line = line.strip()
+            if line and '=' in line:
+                name, value = line.split('=', 1)
+                config[name.strip()] = value.strip().strip('"')
+
+# Setup logging
+log_file = config.get('LOG_FILE', DEFAULT_LOG_FILE)
+
+def setup_logging(log_file_path):
+    """
+    Sets up the logging configuration.
+    If the default log file location is not writable, fall back to /tmp
+    or the current directory.
+    """
+    if not os.access(os.path.dirname(log_file_path), os.W_OK):
+        log_file_path = '/tmp/matrix-mta.log'
+        if not os.access(os.path.dirname(log_file_path), os.W_OK):
+            log_file_path = './matrix-mta.log'
+    logging.basicConfig(filename=log_file_path, level=logging.INFO,
+                        format='%(asctime)s - %(message)s')
+
+setup_logging(log_file)
+
+def log_message(message):
+    """
+    Logs a message to the configured log file.
+    """
+    logging.info(message)
+
+# Get matrix access token
+def get_access_token():
+    """
+    Authenticate with the Matrix server and retrieves an access token.
+    """
+    conn = HTTPSConnection(config['MATRIX_SERVER_URL'].replace('https://', ''))
+    payload = json.dumps({
+        'type': 'm.login.password',
+        'user': config['MATRIX_USERNAME'],
+        'password': config['MATRIX_PASSWORD']
+    })
+    headers = {'Content-Type': 'application/json'}
+    conn.request('POST', '/_matrix/client/r0/login', body=payload,
+                 headers=headers)
+    response = conn.getresponse()
+    data = response.read()
+    result = json.loads(data.decode('utf-8'))
+    log_message(f'Auth response: {result}')
+    return result.get('access_token')
+
+# Create a matrix room and invite the target user
+def create_room_and_invite(access_token):
+    """
+    Create a matrix room and invite the target user.
+    """
+    conn = HTTPSConnection(config['MATRIX_SERVER_URL'].replace('https://', ''))
+    payload = json.dumps({
+        'preset': 'private_chat',
+        'invite': [config['MATRIX_TARGET']],
+        'is_direct': True
+    })
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Content-Type': 'application/json'
+    }
+    conn.request('POST', '/_matrix/client/r0/createRoom', body=payload,
+                 headers=headers)
+    response = conn.getresponse()
+    data = response.read()
+    result = json.loads(data.decode('utf-8'))
+    return result.get('room_id')
+
+# Send message to Matrix
+def send_message_to_matrix(subject, body):
+    """
+    Send a message to the Matrix server.
+    If the room does not exist, create one and invite the target user.
+    """
+    access_token = get_access_token()
+    if not access_token:
+        log_message('Failed to authenticate with the Matrix server.')
+        sys.exit(1)
+
+    room_id_file_path = config.get('ROOM_ID_FILE', DEFAULT_ROOM_ID_FILE)
+    room_id_dir = os.path.dirname(room_id_file_path)
+
+    # Attempt to create the directory for the room-id file
+    try:
+        os.makedirs(room_id_dir, exist_ok=True)
+    except OSError as e:
+        log_message(f'Failed to create directory {room_id_dir}: {e}')
+        room_id_file_path = './room-id'
+
+    if os.path.isfile(room_id_file_path):
+        with open(room_id_file_path, 'r', encoding='utf-8') as room_file:
+            room_id = room_file.read().strip()
+    else:
+        room_id = create_room_and_invite(access_token)
+        if not room_id:
+            log_message('Failed to create a room.')
+            sys.exit(1)
+        with open(room_id_file_path, 'w', encoding='utf-8') as room_file:
+            room_file.write(room_id)
+
+    # Construct the message payload to be sent to the Matrix server.
+    # The payload is a JSON object containing the message type ('m.text')
+    # and the message body, which consists of the email subject and body
+    # separated by two newlines. The subject and body are formatted as plain text.
+    message = json.dumps({
+        'msgtype': 'm.text',
+        'body': f'{subject}\n\n{body}'
+    })
+    # Establish an HTTPS connection to the Matrix server.
+    # The HTTPSConnection class requires only the hostname, so the 'https://'
+    # prefix is removed from the MATRIX_SERVER_URL to get the hostname.
+    # Example: If MATRIX_SERVER_URL is 'https://matrix.example.com',
+    # the resulting connection will be to 'matrix.example.com'.
+    conn = HTTPSConnection(config['MATRIX_SERVER_URL'].replace('https://', ''))
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Content-Type': 'application/json'
+    }
+    # Send a POST request to the Matrix server to send a message to the
+    # specified room.
+    # The endpoint for sending a message is constructed using the room_id.
+    # The message payload, which includes the message type and body, is sent in
+    # the request body.
+    # The headers include the authorization token and content type.
+    # Example: If room_id is '!abcdefg:matrix.example.com', the request URL will be
+    # '/_matrix/client/r0/rooms/!abcdefg:matrix.example.com/send/m.room.message'.
+    conn.request('POST',
+                 f'/_matrix/client/r0/rooms/{room_id}/send/m.room.message',
+                 body=message, headers=headers)
+    response = conn.getresponse()
+    data = response.read()
+    result = json.loads(data.decode('utf-8'))
+    if 'errcode' in result:
+        log_message(f'Failed to send message to Matrix: {result}')
+        sys.exit(1)
+    else:
+        log_message(f'Message sent to Matrix: {result}')
+
+# Parse email
+def parse_email():
+    """
+    Parse the email from stdin and extract the subject and body.
+    """
+    email_data = sys.stdin.read()
+    # Parse the raw email data from stdin into an email message object.
+    # The email.message_from_string function takes the raw email data as a string
+    # and returns an email.message.EmailMessage object that can be used
+    # to extract various parts of the email, such as headers and payloads.
+    msg = email.message_from_string(email_data)
+    subject = msg['subject'] if msg['subject'] else 'No Subject'
+    body = ''
+    # Check if the email message is multipart (contains multiple parts such as
+    # text and attachments).
+    # If the message is multipart, iterate through each part.
+    if msg.is_multipart():
+        for part in msg.walk():
+            # Check if the part is of type 'text/plain'.
+            # We are interested in extracting the plain text content of the email.
+            if part.get_content_type() == 'text/plain':
+                # Get the character set of the part.
+                # If not specified, default to 'utf-8'.
+                charset = part.get_content_charset() or 'utf-8'
+                # Decode the part's payload (content) using the specified charset,
+                # replacing any decoding errors with a placeholder character.
+                body = part.get_payload(decode=True).decode(charset,
+                                                            errors='replace')
+                break # Stop after the first 'text/plain' part is found.
+    else:
+        # If the message is not multipart, handle it as a single part.
+        # Get the character set of the message.
+        # If not specified, default to 'utf-8'.
+        charset = msg.get_content_charset() or 'utf-8'
+        # Decode the message's payload (content) using the specified charset,
+        # replacing any decoding errors with a placeholder character.
+        body = msg.get_payload(decode=True).decode(charset, errors='replace')
+
+    # Return the subject and body of the email.
+    return subject, body
+
+# Main function
+def main():
+    """
+    Main function to handle command-line arguments and send the email content
+    to the Matrix server.
+    """
+    parser = argparse.ArgumentParser(description='Matrix MTA')
+    parser.add_argument('-s', dest='subject',
+                        help='Email subject')
+    parser.add_argument('-f', dest='from_address',
+                        help='From address')
+    parser.add_argument('-i', dest='ignore', action='store_true',
+                        help='Ignored option for compatibility')
+    parser.add_argument('-t', dest='to_address',
+                        help='To address')
+    parser.add_argument('-b', dest='ignore', action='store_true',
+                        help='Ignored option for compatibility')
+    parser.add_argument('-c', dest='ignore', action='store_true',
+                        help='Ignored option for compatibility')
+    parser.add_argument('-O', dest='ignore',
+                        help='Ignored option for compatibility')
+    parser.add_argument('-M', dest='ignore',
+                        help='Ignored option for compatibility')
+    parser.add_argument('-N', dest='ignore',
+                        help='Ignored option for compatibility')
+    parser.add_argument('-R', dest='ignore',
+                        help='Ignored option for compatibility')
+    parser.add_argument('-V', dest='ignore',
+                        help='Ignored option for compatibility')
+    parser.add_argument('-X', dest='ignore',
+                        help='Ignored option for compatibility')
+    parser.add_argument('-q', dest='ignore',
+                        help='Ignored option for compatibility')
+    parser.add_argument('-U', dest='ignore',
+                        help='Ignored option for compatibility')
+    parser.add_argument('-v', dest='ignore', action='store_true',
+                        help='Ignored option for compatibility')
+    parser.add_argument('recipients', nargs='*',
+                        help='Email recipients')
+    args = parser.parse_args()
+
+    # Check if the subject is provided as a command-line argument.
+    # If the subject is provided via the '-s' flag, read the body of the email
+    # from stdin.
+    # This is useful for compatibility with commands like 'mail' which can pass
+    # the subject separately.
+    if args.subject:
+        subject = args.subject
+        body = sys.stdin.read()
+    else:
+        # If the subject is not provided via the '-s' flag, parse the entire
+        # email from stdin.
+        # This approach handles cases where the email data is fully piped to
+        # the script.
+        subject, body = parse_email()
+
+    send_message_to_matrix(subject, body)
+
+# Standard Python idiom to ensure that the `main` function is called only when
+# the script is run directly, and not when it is imported as a module in another
+# script.
+# When the script is executed, the `__name__` variable is set to '__main__'.
+# If the script is imported as a module, `__name__` will be set to the module's
+# name and the `main` function will not be executed automatically.
+if __name__ == '__main__':
+    main()
